@@ -224,6 +224,8 @@ def _split_dataset(root_dataset: Path, **kwargs):
 
     split_dir = {split: root_dataset / split for split in ["train", "test", "val"]}
     for direc in split_dir.values():
+        if direc.exists():
+            shutil.rmtree(str(direc))
         direc.mkdir(exist_ok=True)
 
     # get success prepare-data list
@@ -270,18 +272,33 @@ def _split_dataset(root_dataset: Path, **kwargs):
 
     # random split index
     cif_name = sorted(list(cif_list.keys()))
-    split_idx = (
-        ["train"] * n_split["train"]
-        + ["test"] * n_split["test"]
-        + ["val"] * n_split["val"]
-    )
+    if "train_idx" not in kwargs or "val_idx" not in kwargs or "test_idx" not in kwargs:
+        split_idx = (
+            ["train"] * n_split["train"]
+            + ["test"] * n_split["test"]
+            + ["val"] * n_split["val"]
+        )
+    else:
+
+        def aux_split_fn(i: int) -> str:
+            for s in ["train", "val", "test"]:
+                if i in kwargs[s + "_idx"]:
+                    return s
+            return None
+
+        split_idx = [aux_split_fn(i) for i in range(n_total)]
     np.random.seed(seed=seed)
     np.random.shuffle(split_idx)
 
     assert len(cif_name) == len(split_idx)
 
-    for cif, split in zip(cif_name, split_idx):
+    for idx, (cif, split) in enumerate(zip(cif_name, split_idx)):
         cifpath = cif_list[cif]
+        if "dataset_info" in kwargs:
+            kwargs["dataset_info"].setdefault("dataset_key_index", dict())
+            kwargs["dataset_info"].setdefault("dataset_index_key", dict())
+            kwargs["dataset_info"]["dataset_key_index"][cif] = idx
+            kwargs["dataset_info"]["dataset_index_key"][idx] = cif
         for suffix in ["cif", "graphdata", "grid", "griddata16"]:
             src = getattr(cifpath, suffix)
             dest = root_dataset / split

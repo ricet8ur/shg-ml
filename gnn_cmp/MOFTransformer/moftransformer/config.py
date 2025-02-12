@@ -20,7 +20,7 @@ def config():
 
     # model
     exp_name = "pretrained_mof"
-    seed = 0
+    seed = 42
     loss_names = _loss_names({"regression": 1})
 
     # graph seeting

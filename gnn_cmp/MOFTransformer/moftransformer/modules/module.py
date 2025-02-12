@@ -13,6 +13,15 @@ from moftransformer.modules.module_utils import Normalizer
 
 import numpy as np
 from sklearn.metrics import r2_score
+from aim import Run
+import sys
+
+sys.path.append("../../")
+from utils.experiment_tracking import (
+    track_metrics,
+    log_mean_std_based_on_test_metrics,
+)
+import moftransformer.global_aim
 
 
 class Module(LightningModule):
@@ -118,6 +127,13 @@ class Module(LightningModule):
         self.test_labels = []
         self.test_cifid = []
         self.write_log = True
+        self.loss_array = {}
+        self.all_preds = {}
+        self.all_targets = {}
+        self.all_ids = {}
+        self.crystal_predictions_log = {}
+        self.aux_dict = {}
+        self.fold = 0
 
     def infer(
         self,
@@ -275,23 +291,110 @@ class Module(LightningModule):
         module_utils.set_task(self)
         self.write_log = True
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch: dict, batch_idx):
+        # "[cif_id, atom_num, nbr_idx, nbr_fea, crystal_atom_idx, uni_idx, uni_count, grid, false_grid_data, target]",
+        subset = "train"
         output = self(batch)
+        target = batch["target"]
+
         total_loss = sum([v for k, v in output.items() if "loss" in k])
+        if moftransformer.global_aim.global_aim is not None:
+            regression_logits = output["regression_logits"].data.cpu().tolist()
+            if not hasattr(self, "loss_array") or subset not in self.loss_array:
+                self.loss_array[subset] = []
+                self.all_preds[subset] = []
+                self.all_targets[subset] = []
+                self.all_ids[subset] = []
+            self.all_ids[subset].extend(batch["cif_id"])
+            self.all_preds[subset].extend(regression_logits)
+            self.all_targets[subset].extend(target)
+            self.loss_array[subset].append(total_loss.item())
         return total_loss
 
     def on_train_epoch_end(self):
         module_utils.epoch_wrapup(self)
+        subset = "train"
+        if moftransformer.global_aim.global_aim is not None:
+            self.all_ids[subset] = [
+                self.aux_dict["dataset_key_index"][i] for i in self.all_ids[subset]
+            ]
+            track_metrics(
+                moftransformer.global_aim.global_aim,
+                subset=subset,
+                fold=self.fold,
+                epoch=self.current_epoch,
+                loss=sum(self.loss_array[subset]),
+                keys=self.all_ids[subset],
+                predict=self.all_preds[subset],
+                target=self.all_targets[subset],
+                to_track=subset != "test",
+            )
+            for i, k in enumerate(self.all_ids[subset]):
+                self.crystal_predictions_log.setdefault(k, [])
+                self.crystal_predictions_log[k].append(self.all_preds[subset][i])
+            moftransformer.global_aim.crystal_predictions_log = (
+                self.crystal_predictions_log.copy()
+            )
+            self.loss_array[subset] = []
+            self.all_preds[subset] = []
+            self.all_targets[subset] = []
+            self.all_ids[subset] = []
 
     def on_validation_start(self):
         module_utils.set_task(self)
         self.write_log = True
 
     def validation_step(self, batch, batch_idx):
+        subset = "val"
         output = self(batch)
+        target = batch["target"]
+        # print(f"{target=}")
+        # print(f"{batch['cif_id']=}")
+        # print(f"{batch_idx=}")
+        # print(f"{output=}")
+
+        # print(f"{moftransformer.global_aim.global_aim=}")
+        total_loss = sum([v for k, v in output.items() if "loss" in k])
+        if moftransformer.global_aim.global_aim is not None:
+            regression_logits = output["regression_logits"].data.cpu().tolist()
+            if not hasattr(self, "loss_array") or subset not in self.loss_array:
+                self.loss_array[subset] = []
+                self.all_preds[subset] = []
+                self.all_targets[subset] = []
+                self.all_ids[subset] = []
+            self.all_ids[subset].extend(batch["cif_id"])
+            self.all_preds[subset].extend(regression_logits)
+            self.all_targets[subset].extend(target)
+            self.loss_array[subset].append(total_loss.item())
 
     def on_validation_epoch_end(self) -> None:
         module_utils.epoch_wrapup(self)
+        subset = "val"
+        if moftransformer.global_aim.global_aim is not None:
+            self.all_ids[subset] = [
+                self.aux_dict["dataset_key_index"][i] for i in self.all_ids[subset]
+            ]
+            track_metrics(
+                moftransformer.global_aim.global_aim,
+                subset=subset,
+                fold=self.fold,
+                epoch=self.current_epoch,
+                loss=sum(self.loss_array[subset]),
+                keys=self.all_ids[subset],
+                predict=self.all_preds[subset],
+                target=self.all_targets[subset],
+                to_track=subset != "test",
+            )
+            for i, k in enumerate(self.all_ids[subset]):
+                self.crystal_predictions_log.setdefault(k, [])
+                self.crystal_predictions_log[k].append(self.all_preds[subset][i])
+            moftransformer.global_aim.crystal_predictions_log = (
+                self.crystal_predictions_log.copy()
+            )
+            self.loss_array[subset] = []
+            self.all_preds[subset] = []
+            self.all_targets[subset] = []
+            self.all_ids[subset] = []
 
     def on_test_start(
         self,
@@ -299,6 +402,7 @@ class Module(LightningModule):
         module_utils.set_task(self)
 
     def test_step(self, batch, batch_idx):
+        subset = "test"
         output = self(batch)
         output = {
             k: (v.cpu() if torch.is_tensor(v) else v) for k, v in output.items()
@@ -307,7 +411,25 @@ class Module(LightningModule):
         if "regression_logits" in output.keys():
             self.test_logits += output["regression_logits"].tolist()
             self.test_labels += output["regression_labels"].tolist()
-        return output
+        target = batch["target"]
+        # print(f"{target=}")
+        # print(f"{batch['cif_id']=}")
+        # print(f"{batch_idx=}")
+        # print(f"{output=}")
+
+        # print(f"{moftransformer.global_aim.global_aim=}")
+        total_loss = sum([v for k, v in output.items() if "loss" in k])
+        if moftransformer.global_aim.global_aim is not None:
+            regression_logits = output["regression_logits"].data.cpu().tolist()
+            if not hasattr(self, "loss_array") or subset not in self.loss_array:
+                self.loss_array[subset] = []
+                self.all_preds[subset] = []
+                self.all_targets[subset] = []
+                self.all_ids[subset] = []
+            self.all_ids[subset].extend(batch["cif_id"])
+            self.all_preds[subset].extend(regression_logits)
+            self.all_targets[subset].extend(target)
+            self.loss_array[subset].append(total_loss.item())
 
     def on_test_epoch_end(self):
         module_utils.epoch_wrapup(self)
@@ -318,6 +440,33 @@ class Module(LightningModule):
             self.log(f"test/r2_score", r2, sync_dist=True)
             self.test_labels.clear()
             self.test_logits.clear()
+        subset = "test"
+        if moftransformer.global_aim.global_aim is not None:
+            self.all_ids[subset] = [
+                self.aux_dict["dataset_key_index"][i] for i in self.all_ids[subset]
+            ]
+            track_metrics(
+                moftransformer.global_aim.global_aim,
+                subset=subset,
+                fold=self.fold,
+                epoch=self.current_epoch,
+                loss=sum(self.loss_array[subset]),
+                keys=self.all_ids[subset],
+                predict=self.all_preds[subset],
+                target=self.all_targets[subset],
+                to_track=subset != "test",
+            )
+            for i, k in enumerate(self.all_ids[subset]):
+                self.crystal_predictions_log.setdefault(k, [])
+                self.crystal_predictions_log[k].append(self.all_preds[subset][i])
+            moftransformer.global_aim.crystal_predictions_log = (
+                self.crystal_predictions_log.copy()
+            )
+            self.loss_array[subset] = []
+            self.all_preds[subset] = []
+            self.all_targets[subset] = []
+            self.all_ids[subset] = []
+        moftransformer.global_aim.global_aim["hparams"] = self.hparams.config
 
     def configure_optimizers(self):
         return module_utils.set_schedule(self)

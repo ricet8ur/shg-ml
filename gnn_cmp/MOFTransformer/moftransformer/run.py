@@ -17,6 +17,8 @@ from moftransformer.utils.validation import (
     get_num_devices,
     ConfigurationError,
 )
+import moftransformer.global_aim
+from aim import Run
 
 warnings.filterwarnings(
     "ignore", ".*Trying to infer the `batch_size` from an ambiguous collection.*"
@@ -199,9 +201,9 @@ def run(root_dataset, downstream=None, log_dir="logs/", *, test_only=False, **kw
     """
 
     config = copy.deepcopy(_config())
-    for key in kwargs.keys():
-        if key not in config:
-            raise ConfigurationError(f"{key} is not in configuration.")
+    # for key in kwargs.keys():
+    #     if key not in config:
+    #         raise ConfigurationError(f"{key} is not in configuration.")
 
     config.update(kwargs)
     config["root_dataset"] = root_dataset
@@ -209,17 +211,41 @@ def run(root_dataset, downstream=None, log_dir="logs/", *, test_only=False, **kw
     config["log_dir"] = log_dir
     config["test_only"] = test_only
 
-    main(config)
+    main(
+        config,
+        kwargs["logger"] if "logger" in kwargs else None,
+        kwargs["aux_dict"] if "aux_dict" in kwargs else None,
+        kwargs["fold"] if "fold" in kwargs else None,
+    )
 
 
 @ex.automain
-def main(_config):
+def main(
+    _config,
+    logger=None,
+    aux_dict: dict | None = None,
+    fold: int = 0,
+):
     _config = copy.deepcopy(_config)
     pl.seed_everything(_config["seed"])
 
     _config = get_valid_config(_config)
     dm = Datamodule(_config)
     model = Module(_config)
+    # model.aim_run = aim_run
+    model.aux_dict = aux_dict
+    model.fold = fold
+
+    # print(f"{moftransformer.global_aim.global_aim=}")
+    if moftransformer.global_aim.global_aim is not None:
+        moftransformer.global_aim.global_aim["model_parameters_count"] = sum(
+            p.numel() for p in model.parameters()
+        )
+        moftransformer.global_aim.global_aim["model_trainable_parameters_count"] = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
+    # logger = _config["logger"]
+    # logger = _config["logger"]
     exp_name = f"{_config['exp_name']}"
 
     os.makedirs(_config["log_dir"], exist_ok=True)
@@ -232,10 +258,14 @@ def main(_config):
     )
 
     if _config["test_only"]:
-        name = f'test_{exp_name}_seed{_config["seed"]}_from_{str(_config["load_path"]).split("/")[-1][:-5]}'
+        name = f"test_{exp_name}_seed{_config['seed']}_from_{str(_config['load_path']).split('/')[-1][:-5]}"
     else:
-        name = f'{exp_name}_seed{_config["seed"]}_from_{str(_config["load_path"]).split("/")[-1][:-5]}'
+        name = f"{exp_name}_seed{_config['seed']}_from_{str(_config['load_path']).split('/')[-1][:-5]}"
 
+    # logger = pl.loggers.TensorBoardLogger(
+    #     _config["log_dir"],
+    #     name=name,
+    # )
     logger = pl.loggers.TensorBoardLogger(
         _config["log_dir"],
         name=name,
@@ -288,9 +318,12 @@ def main(_config):
     if not _config["test_only"]:
         trainer.fit(model, datamodule=dm, ckpt_path=_config["resume_from"])
         trainer.test(model, datamodule=dm, ckpt_path="best")
-        log_dir = Path(logger.log_dir) / "checkpoints"
-        if best_model := next(log_dir.glob("epoch=*.ckpt")):
-            shutil.copy(best_model, log_dir / "best.ckpt")
+        # log_dir = Path(logger.log_dir) / "checkpoints"
+        # if best_model := next(log_dir.glob("epoch=*.ckpt")):
+        #     shutil.copy(best_model, log_dir / "best.ckpt")
+        # log_dir = Path(logger.log_dir) / "checkpoints"
+        # if best_model := next(log_dir.glob("epoch=*.ckpt")):
+        #     shutil.copy(best_model, log_dir / "best.ckpt")
 
     else:
         trainer.test(model, datamodule=dm)

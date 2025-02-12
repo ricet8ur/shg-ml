@@ -2,6 +2,7 @@
 import functools
 from typing import Optional
 
+import torch
 from torch.utils.data import DataLoader
 
 from pytorch_lightning import LightningDataModule
@@ -23,8 +24,10 @@ class Datamodule(LightningDataModule):
         self.downstream = _config["downstream"]
 
         self.nbr_fea_len = _config["nbr_fea_len"]
+        random_seed = _config["seed"]
 
         self.tasks = [k for k, v in _config["loss_names"].items() if v >= 1]
+        self.g = torch.manual_seed(random_seed)
 
     @property
     def dataset_cls(self):
@@ -79,6 +82,8 @@ class Datamodule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             collate_fn=self.collate,
+            shuffle=True,
+            generator=self.g,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -87,6 +92,8 @@ class Datamodule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             collate_fn=self.collate,
+            shuffle=True,
+            generator=self.g,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -95,4 +102,6 @@ class Datamodule(LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             collate_fn=self.collate,
+            shuffle=True,
+            generator=self.g,
         )
