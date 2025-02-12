@@ -171,4 +171,8 @@ cython_debug/
 .pypirc
 
 __MACOSX
-data/raw_data/private
+data/raw_data/private/*
+*.cif
+*.pth.tar
+.aim
+artifacts
