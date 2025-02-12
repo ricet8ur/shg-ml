@@ -176,3 +176,5 @@ data/raw_data/private/*
 *.pth.tar
 .aim
 artifacts
+trained
+gnn_cmp/alignn/pre-trained/*

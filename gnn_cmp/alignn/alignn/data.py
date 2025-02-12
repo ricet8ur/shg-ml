@@ -187,7 +187,9 @@ def get_torch_dataset(
 ):
     """Get Torch Dataset."""
     df = pd.DataFrame(dataset)
-    # print("df", df)
+    # print("df\n", df, "\n", df.columns, target in df.columns)
+    # print(df["target"], "target")
+    # print(df[target])
     vals = df[target].values
     print("data range", np.max(vals), np.min(vals))
     f = open(os.path.join(output_dir, tmp_name + "_data_range"), "w")
@@ -248,6 +250,9 @@ def get_train_val_loaders(
     keep_data_order=False,
     output_features=1,
     output_dir=None,
+    id_train=None,
+    id_val=None,
+    id_test=None
 ):
     """Help function to set up JARVIS train and val dataloaders."""
     train_sample = filename + "_train.data"
@@ -356,17 +361,18 @@ def get_train_val_loaders(
         # id_test = ids[-test_size:]
         # if standardize:
         #    data.setup_standardizer(id_train)
-        id_train, id_val, id_test = get_id_train_val_test(
-            total_size=len(dat),
-            split_seed=split_seed,
-            train_ratio=train_ratio,
-            val_ratio=val_ratio,
-            test_ratio=test_ratio,
-            n_train=n_train,
-            n_test=n_test,
-            n_val=n_val,
-            keep_data_order=keep_data_order,
-        )
+        if id_train is None or id_val is None or id_test is None: 
+            id_train, id_val, id_test = get_id_train_val_test(
+                total_size=len(dat),
+                split_seed=split_seed,
+                train_ratio=train_ratio,
+                val_ratio=val_ratio,
+                test_ratio=test_ratio,
+                n_train=n_train,
+                n_test=n_test,
+                n_val=n_val,
+                keep_data_order=keep_data_order,
+            )
         ids_train_val_test = {}
         ids_train_val_test["id_train"] = [dat[i][id_tag] for i in id_train]
         ids_train_val_test["id_val"] = [dat[i][id_tag] for i in id_val]
@@ -490,6 +496,8 @@ def get_train_val_loaders(
         if line_graph:
             collate_fn = train_data.collate_line_graph
 
+        g = torch.manual_seed(split_seed)
+
         # use a regular pytorch dataloader
         train_loader = DataLoader(
             train_data,
@@ -499,6 +507,7 @@ def get_train_val_loaders(
             drop_last=True,
             num_workers=workers,
             pin_memory=pin_memory,
+            generator=g
         )
 
         val_loader = DataLoader(

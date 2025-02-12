@@ -52,6 +52,7 @@ def train_for_folder(
     keep_data_order=False,
     classification_threshold=None,
     output_dir=None,
+    model=None,
 ):
     """Train for a folder."""
     # config_dat=os.path.join(root_dir,config_name)
@@ -78,11 +79,12 @@ def train_for_folder(
     lists_length_equal = True
     for i in data:
         info = {}
-        poscar_name = i[0]
-        poscar_path = os.path.join(root_dir, poscar_name)
-        atoms = Atoms.from_poscar(poscar_path)
+        cif_name = i[0]
+        cif_path = os.path.join(root_dir, cif_name)
+        atoms = Atoms.from_cif(cif_path)
+        print(cif_name)
         info["atoms"] = atoms.to_dict()
-        info["jid"] = poscar_name
+        info["jid"] = cif_name
 
         tmp = [float(j) for j in i[1:]]  # float(i[1])
         if len(tmp) == 1:
@@ -144,6 +146,7 @@ def train_for_folder(
 
     train_dgl(
         config,
+        model,
         train_val_test_loaders=[
             train_loader,
             val_loader,

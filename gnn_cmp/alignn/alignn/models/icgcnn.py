@@ -1,14 +1,14 @@
 """CGCNN: dgl implementation."""
 
-from typing import Tuple
+from typing import Tuple, Literal
 import dgl
 import dgl.function as fn
 
 # import numpy as np
 import torch
 import torch.nn.functional as F
-from dgl.nn import AvgPooling
-from pydantic.typing import Literal
+from dgl.nn.pytorch.glob import AvgPooling
+# from pydantic.typing import Literal
 from torch import nn
 
 from alignn.models.utils import RBFExpansion

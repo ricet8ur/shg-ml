@@ -1,8 +1,10 @@
 """A baseline graph convolution network dgl implementation."""
 # import dgl
+from typing import Literal
 import torch
-from dgl.nn import AvgPooling, GraphConv
-from pydantic.typing import Literal
+from dgl.nn.pytorch.glob import AvgPooling
+from dgl.nn.pytorch.conv import GraphConv
+# from pydantic.typing import Literal
 from torch import nn
 from torch.nn import functional as F
 

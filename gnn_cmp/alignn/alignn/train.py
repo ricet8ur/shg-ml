@@ -12,7 +12,7 @@ from typing import Any, Dict, Union
 import ignite
 import torch
 from ignite.contrib.handlers import TensorboardLogger
-from ignite.contrib.handlers.stores import EpochOutputStore
+from ignite.handlers.stores import EpochOutputStore
 from ignite.handlers import EarlyStopping
 from ignite.contrib.handlers.tensorboard_logger import (
     global_step_from_engine,
@@ -49,6 +49,14 @@ import json
 import pprint
 
 import os
+from aim import Run
+from torch.utils.data import DataLoader
+import sys
+sys.path.append('../../')
+from utils.experiment_tracking import track_metrics, log_mean_std_based_on_test_metrics
+from utils.save_and_load import save_to_json
+import time
+from sklearn.metrics import mean_squared_error
 
 # from sklearn.decomposition import PCA, KernelPCA
 # from sklearn.preprocessing import StandardScaler
@@ -128,10 +136,13 @@ def setup_optimizer(params, config: TrainingConfig):
 
 
 def train_dgl(
+    run:Run,
     config: Union[TrainingConfig, Dict[str, Any]],
     model: nn.Module = None,
     # checkpoint_dir: Path = Path("./"),
+    jsons_to_log:dict={},
     train_val_test_loaders=[],
+    fold:int = 0
     # log_tensorboard: bool = False,
 ):
     """Training entry point for DGL networks.
@@ -271,6 +282,7 @@ def train_dgl(
 
     elif config.scheduler == "onecycle":
         steps_per_epoch = len(train_loader)
+        # print(steps_per_epoch)
         # pct_start = config.warmup_steps / (config.epochs * steps_per_epoch)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -383,7 +395,7 @@ def train_dgl(
         handler = Checkpoint(
             to_save,
             DiskSaver(checkpoint_dir, create_dir=True, require_empty=False),
-            n_saved=2,
+            n_saved=1,
             global_step_transform=lambda *_: trainer.state.epoch,
         )
         trainer.add_event_handler(Events.EPOCH_COMPLETED, handler)
@@ -405,12 +417,17 @@ def train_dgl(
         train_eos = EpochOutputStore()
         train_eos.attach(train_evaluator)
 
+    
+    crystal_predictions_log = {}
+
     # collect evaluation performance
     @trainer.on(Events.EPOCH_COMPLETED)
     def log_results(engine):
         """Print training and validation metrics to console."""
         train_evaluator.run(train_loader)
+        val_t = time.time()
         evaluator.run(val_loader)
+        run.track(time.time() - val_t, name="val_time", context={"fold": fold})
 
         tmetrics = train_evaluator.state.metrics
         vmetrics = evaluator.state.metrics
@@ -450,6 +467,51 @@ def train_dgl(
             else:
                 pbar.log_message(f"Train ROC AUC: {tmetrics['rocauc']:.4f}")
                 pbar.log_message(f"Val ROC AUC: {vmetrics['rocauc']:.4f}")
+        # rerun manually to log all info to aim
+        net.eval()
+        def inference_on_loader(loader: DataLoader, subset: str):
+            targets = []
+            predictions = []
+            with torch.no_grad():
+                ids = loader.dataset.ids  # [test_loader.dataset.indices]
+                # print(dir(loader.dataset))
+                # print(len(loader.dataset))
+                for dat in loader:
+                    g, lg, target = dat
+                    out_data = net([g.to(device), lg.to(device)])
+                    out_data = out_data.cpu().numpy().tolist()
+                    if config.standard_scalar_and_pca:
+                        sc = pk.load(open(os.path.join(tmp_output_dir, "sc.pkl"), "rb"))
+                        out_data = sc.transform(np.array(out_data).reshape(-1, 1))[0][0]
+                    target = target.cpu().numpy().flatten().tolist()
+                    # if len(target) == 1:
+                    #     target = target[0]
+                    # print(target,out_data,idx)
+                    targets.extend(target)
+                    try:
+                        predictions.extend(out_data)
+                    except:
+                        predictions.append(out_data)
+
+                # print(len(predictions),len(targets),len(ids))
+                track_metrics(
+                    run,
+                    subset=subset,
+                    fold=fold,
+                    epoch=trainer.state.epoch,
+                    loss=mean_squared_error(targets, predictions),
+                    keys=ids,
+                    predict=predictions,
+                    target=targets,
+                    to_track=subset != "test",
+                )
+                for i, p in enumerate(predictions):
+                    crystal_predictions_log.setdefault(ids[i], [])
+                    crystal_predictions_log[ids[i]].append(p)
+
+        inference_on_loader(train_loader, "train")
+        inference_on_loader(val_loader, "val")
+
 
     if config.n_early_stopping is not None:
         if classification:
@@ -486,7 +548,9 @@ def train_dgl(
             )
 
     # train the model!
+    t = time.time()
     trainer.run(train_loader, max_epochs=config.epochs)
+    run.track(time.time() - t, name="train_time", context={"fold": fold})
 
     if config.log_tensorboard:
         test_loss = evaluator.state.metrics["loss"]
@@ -560,6 +624,7 @@ def train_dgl(
         and not classification
         and config.model.output_features == 1
     ):
+        t = time.time()
         net.eval()
         f = open(
             os.path.join(config.output_dir, "prediction_results_test_set.csv"),
@@ -587,34 +652,84 @@ def train_dgl(
                 f.write("%s, %6f, %6f\n" % (id, target, out_data))
                 targets.append(target)
                 predictions.append(out_data)
+        run.track(time.time() - t, name="test_time", context={"fold": fold})
         f.close()
+        track_metrics(
+            run,
+            subset="test",
+            fold=fold,
+            epoch=trainer.state.epoch,
+            loss=mean_squared_error(targets, predictions),
+            keys=ids,
+            predict=predictions,
+            target=targets,
+            to_track=False,
+        )
+
+        for i, p in enumerate(predictions):
+            crystal_predictions_log.setdefault(ids[i], [])
+            crystal_predictions_log[ids[i]].append(p)
+
         from sklearn.metrics import mean_absolute_error
 
         print(
             "Test MAE:",
             mean_absolute_error(np.array(targets), np.array(predictions)),
         )
-        if config.store_outputs and not classification:
-            x = []
-            y = []
-            for i in history["EOS"]:
-                x.append(i[0].cpu().numpy().tolist())
-                y.append(i[1].cpu().numpy().tolist())
-            x = np.array(x, dtype="float").flatten()
-            y = np.array(y, dtype="float").flatten()
-            f = open(
-                os.path.join(
-                    config.output_dir, "prediction_results_train_set.csv"
-                ),
-                "w",
-            )
-            # TODO: Add IDs
-            f.write("target,prediction\n")
-            for i, j in zip(x, y):
-                f.write("%6f, %6f\n" % (j, i))
-                line = str(i) + "," + str(j) + "\n"
-                f.write(line)
-            f.close()
+    crystal_predictions_log_for_all_folds = dict(
+        fold=jsons_to_log['crystal_predictions_log_for_all_folds'].get("fold", {})
+        | {fold: crystal_predictions_log}
+    )
+    jsons_to_log['crystal_predictions_log_for_all_folds'] = (
+        crystal_predictions_log_for_all_folds
+    )
+    json_name = "train_info.json"
+    save_to_json(jsons_to_log, json_name)
+    run.log_artifact(json_name)
+        # if config.store_outputs and not classification:
+        #     # x = []
+        #     # y = []
+        #     # for i in history["EOS"]:
+        #     #     x.append(i[0].cpu().numpy().tolist())
+        #     #     y.append(i[1].cpu().numpy().tolist())
+        #     # x = np.array(x, dtype="float").flatten()
+        #     # y = np.array(y, dtype="float").flatten()
+        #     f = open(
+        #         os.path.join(
+        #             config.output_dir, "prediction_results_train_set.csv"
+        #         ),
+        #         "w",
+        #     )
+        #     # # TODO: Add IDs
+        #     # f.write("target,prediction\n")
+        #     # for i, j in zip(x, y):
+        #     #     f.write("%6f, %6f\n" % (j, i))
+        #     #     # error:
+        #     #     # line = str(i) + "," + str(j) + "\n"
+        #     #     # f.write(line)
+        #     # f.close()
+        #     targets = []
+        #     predictions = []
+        #     with torch.no_grad():
+        #         ids = train_loader.dataset.ids  # [test_loader.dataset.indices]
+        #         for dat, id in zip(train_loader, ids):
+        #             g, lg, target = dat
+        #             out_data = net([g.to(device), lg.to(device)])
+        #             out_data = out_data.cpu().numpy().tolist()
+        #             if config.standard_scalar_and_pca:
+        #                 sc = pk.load(
+        #                     open(os.path.join(tmp_output_dir, "sc.pkl"), "rb")
+        #                 )
+        #                 out_data = sc.transform(np.array(out_data).reshape(-1, 1))[
+        #                     0
+        #                 ][0]
+        #             target = target.cpu().numpy().flatten().tolist()
+        #             if len(target) == 1:
+        #                 target = target[0]
+        #             f.write("%s, %6f, %6f\n" % (id, target, out_data))
+        #             targets.append(target)
+        #             predictions.append(out_data)
+        #     f.close()
 
     # TODO: Fix IDs for train loader
     """

@@ -2,16 +2,16 @@
 
 A prototype crystal line graph network dgl implementation.
 """
-from typing import Tuple, Union
+from typing import Tuple, Union, Literal
 
 import dgl
 import dgl.function as fn
 import numpy as np
 import torch
-from dgl.nn import AvgPooling
+from dgl.nn.pytorch.glob import AvgPooling
 
 # from dgl.nn.functional import edge_softmax
-from pydantic.typing import Literal
+# from pydantic.typing import Literal
 from torch import nn
 from torch.nn import functional as F
 
@@ -268,6 +268,7 @@ class ALIGNN(nn.Module):
         y: bond features (g.edata and lg.ndata)
         z: angle features (lg.edata)
         """
+        # with torch.no_grad():
         if len(self.alignn_layers) > 0:
             g, lg = g
             lg = lg.local_var()
@@ -295,6 +296,7 @@ class ALIGNN(nn.Module):
 
         # norm-activation-pool-classify
         h = self.readout(g, x)
+        # ! torch.nograd
         out = self.fc(h)
 
         if self.link:
