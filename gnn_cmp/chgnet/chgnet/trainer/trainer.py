@@ -20,12 +20,18 @@ from torch.optim.lr_scheduler import (
 
 from chgnet.model.model import CHGNet
 from chgnet.utils import AverageMeter, determine_device, mae, write_json
+from chgnet.graph import CrystalGraph
 
 try:
     import wandb
 except ImportError:
     wandb = None
+from aim import Run
+import sys
 
+sys.path.append("../../")
+from utils.experiment_tracking import track_metrics, log_mean_std_based_on_test_metrics
+from utils.save_and_load import save_to_json
 
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
@@ -250,6 +256,9 @@ class Trainer:
                 config=self.trainer_args | (extra_run_config or {}),
                 **(wandb_init_kwargs or {}),
             )
+        self.run: Run = None
+        self.fold: int = -1
+        self.crystal_predictions_log: dict = {}
 
     def train(
         self,
@@ -300,16 +309,17 @@ class Trainer:
         for param in self.model.composition_model.parameters():
             param.requires_grad = train_composition_model
 
+        t = time.time()
         for epoch in range(self.starting_epoch, self.epochs):
             # train
-            train_mae = self._train(train_loader, epoch, wandb_log_freq)
+            train_mae = self._train(train_loader, epoch, wandb_log_freq, epoch)
             if "e" in train_mae and train_mae["e"] != train_mae["e"]:
                 print("Exit due to NaN")
                 break
 
             # val
             val_mae = self._validate(
-                val_loader, is_test=False, wandb_log_freq=wandb_log_freq
+                val_loader, is_test=False, wandb_log_freq=wandb_log_freq, epoch=epoch
             )
             for key in self.targets:
                 self.training_history[key]["train"].append(train_mae[key])
@@ -333,6 +343,11 @@ class Trainer:
                     | {f"val_{k}_mae": v for k, v in val_mae.items()}
                     | {"epoch": epoch}
                 )
+        if self.run is not None:
+            self.run.track(
+                time.time() - t, name="train_time", context={"fold": self.fold}
+            )
+        t = time.time()
 
         if test_loader is not None:
             # test best model
@@ -357,11 +372,17 @@ class Trainer:
             if wandb is not None and self.trainer_args.get("wandb_path"):
                 wandb.log({f"test_{k}_mae": v for k, v in test_mae.items()})
 
+        if self.run is not None:
+            self.run.track(
+                time.time() - t, name="test_time", context={"fold": self.fold}
+            )
+
     def _train(
         self,
         train_loader: DataLoader,
         current_epoch: int,
         wandb_log_freq: LogFreq = LogEachBatch,
+        epoch: int = 0,
     ) -> dict:
         """Train all data for one epoch.
 
@@ -382,21 +403,30 @@ class Trainer:
 
         # switch to train mode
         self.model.train()
+        ids = []
+        all_preds = []
+        all_targets = []
 
         start = time.perf_counter()  # start timer
         for idx, (graphs, targets) in enumerate(train_loader):
             # measure data loading time
             data_time.update(time.perf_counter() - start)
-
+            graphs: list[CrystalGraph] = graphs
+            targets: dict[str, Tensor] = targets
             # get input
             for g in graphs:
                 requires_force = "f" in self.targets
                 g.atom_frac_coord.requires_grad = requires_force
+            ids = ids + [int(g.mp_id) for g in graphs]
+            # print(f'{targets["e"].shape=}')
+            all_targets.extend(targets["e"].data.cpu().tolist())
+
             graphs = [g.to(self.device) for g in graphs]
             targets = {k: self.move_to(v, self.device) for k, v in targets.items()}
-
             # compute output
-            prediction = self.model(graphs, task=self.targets)
+            prediction: dict[str, Tensor] = self.model(graphs, task=self.targets)
+            # print(f'{prediction["e"].shape=}')
+            all_preds.extend(prediction["e"].data.cpu().tolist())
             combined_loss = self.criterion(targets, prediction)
 
             losses.update(combined_loss["loss"].data.cpu().item(), len(graphs))
@@ -445,6 +475,21 @@ class Trainer:
                     {f"train_{k}_mae": v.avg for k, v in mae_errors.items()}
                     | {"train_loss": losses.avg, "epoch": current_epoch, "batch": idx}
                 )
+        subset = "train"
+        track_metrics(
+            self.run,
+            subset=subset,
+            fold=self.fold,
+            epoch=epoch,
+            loss=losses.avg,
+            keys=ids,
+            predict=all_preds,
+            target=all_targets,
+            to_track=subset != "test",
+        )
+        for i, k in enumerate(ids):
+            self.crystal_predictions_log.setdefault(k, [])
+            self.crystal_predictions_log[k].append(all_preds[i])
 
         return {key: round(err.avg, 6) for key, err in mae_errors.items()}
 
@@ -455,6 +500,7 @@ class Trainer:
         is_test: bool = False,
         test_result_save_path: str | None = None,
         wandb_log_freq: LogFreq = LogEachBatch,
+        epoch: int = 0,
     ) -> dict:
         """Validation or test step.
 
@@ -480,8 +526,18 @@ class Trainer:
         if is_test:
             test_pred = []
 
+        ids = []
+        all_preds = []
+        all_targets = []
+
         end = time.perf_counter()
         for ii, (graphs, targets) in enumerate(val_loader):
+            graphs: list[CrystalGraph] = graphs
+            targets: dict[str, Tensor] = targets
+
+            ids = ids + [int(g.mp_id) for g in graphs]
+            all_targets.extend(targets["e"].data.cpu().tolist())
+
             if "f" in self.targets or "s" in self.targets:
                 for graph in graphs:
                     requires_force = "f" in self.targets
@@ -496,7 +552,9 @@ class Trainer:
                     }
 
             # compute output
-            prediction = self.model(graphs, task=self.targets)
+            prediction: dict[str, Tensor] = self.model(graphs, task=self.targets)
+            all_preds.extend(prediction["e"].data.cpu().tolist())
+
             combined_loss = self.criterion(targets, prediction)
 
             losses.update(combined_loss["loss"].data.cpu().item(), len(graphs))
@@ -589,6 +647,22 @@ class Trainer:
             and self.trainer_args.get("wandb_path")
         ):
             wandb.log({f"val_{k}_mae": v.avg for k, v in mae_errors.items()})
+
+        subset = "test" if is_test else "val"
+        track_metrics(
+            self.run,
+            subset=subset,
+            fold=self.fold,
+            epoch=epoch,
+            loss=losses.avg,
+            keys=ids,
+            predict=all_preds,
+            target=all_targets,
+            to_track=subset != "test",
+        )
+        for i, k in enumerate(ids):
+            self.crystal_predictions_log.setdefault(k, [])
+            self.crystal_predictions_log[k].append(all_preds[i])
 
         return {k: round(mae_error.avg, 6) for k, mae_error in mae_errors.items()}
 

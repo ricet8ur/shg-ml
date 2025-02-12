@@ -159,12 +159,12 @@ class StructureData(Dataset):
                     mp_id = self.structure_ids[graph_id]
                 else:
                     mp_id = graph_id
-                crystal_graph = self.graph_converter(
+                crystal_graph: CrystalGraph = self.graph_converter(
                     struct, graph_id=graph_id, mp_id=mp_id
                 )
                 targets = {
                     "e": torch.tensor(self.energies[graph_id], dtype=TORCH_DTYPE),
-                    "f": torch.tensor(self.forces[graph_id], dtype=TORCH_DTYPE),
+                    # "f": torch.tensor(self.forces[graph_id], dtype=TORCH_DTYPE), not used
                 }
                 if self.stresses is not None:
                     # Convert VASP stress
@@ -797,6 +797,10 @@ def get_train_val_test_loader(
     return_test: bool = True,
     num_workers: int = 0,
     pin_memory: bool = True,
+    train_idx: list[int] = None,
+    val_idx: list[int] = None,
+    test_idx: list[int] = None,
+    split_seed: int = 42,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Randomly partition a dataset into train, val, test loaders.
 
@@ -824,12 +828,14 @@ def get_train_val_test_loader(
     random.shuffle(indices)
     train_size = int(train_ratio * total_size)
     val_size = int(val_ratio * total_size)
-
+    g = torch.manual_seed(split_seed)
     train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
         collate_fn=collate_graphs,
-        sampler=SubsetRandomSampler(indices=indices[0:train_size]),
+        sampler=SubsetRandomSampler(indices=indices[0:train_size])
+        if train_idx is None
+        else SubsetRandomSampler(train_idx, g),
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
@@ -837,9 +843,9 @@ def get_train_val_test_loader(
         dataset,
         batch_size=batch_size,
         collate_fn=collate_graphs,
-        sampler=SubsetRandomSampler(
-            indices=indices[train_size : train_size + val_size]
-        ),
+        sampler=SubsetRandomSampler(indices=indices[train_size : train_size + val_size])
+        if val_idx is None
+        else SubsetRandomSampler(val_idx, g),
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
@@ -848,7 +854,9 @@ def get_train_val_test_loader(
             dataset,
             batch_size=batch_size,
             collate_fn=collate_graphs,
-            sampler=SubsetRandomSampler(indices=indices[train_size + val_size :]),
+            sampler=SubsetRandomSampler(indices=indices[train_size + val_size :])
+            if test_idx is None
+            else SubsetRandomSampler(test_idx, g),
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
