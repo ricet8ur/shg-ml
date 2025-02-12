@@ -70,7 +70,7 @@ class GNNNodeEmbedding(torch.nn.Module):
 class GNN_Graph(nn.Module):
 
     def __init__(self, num_classes=1, num_layer=4, emb_dim=300, residual=False, drop_ratio=0, JK="last",
-                 graph_pooling="attention"):
+                 graph_pooling="attention", use_gap =True):
         super(GNN_Graph, self).__init__()
 
         self.num_layer = num_layer
@@ -78,6 +78,7 @@ class GNN_Graph(nn.Module):
         self.JK = JK
         self.emb_dim = emb_dim
         self.num_classes = num_classes
+        self.use_gap = use_gap
 
         if self.num_layer < 2:
             raise ValueError("Number of GNN layers must be greater than 1.")
@@ -101,17 +102,28 @@ class GNN_Graph(nn.Module):
             self.graph_pred_linear = nn.Linear(2 * self.emb_dim, self.num_classes)
         else:
             self.graph_pred_linear = nn.Linear(self.emb_dim, self.num_classes)
-        self.hidden0 = nn.Sequential(
-            nn.Linear(self.emb_dim+10, (self.emb_dim+10)* 2),
-            nn.ReLU(),
-            nn.Linear((self.emb_dim+10)* 2, self.emb_dim+10),
-            nn.ReLU(),
-            nn.Linear(self.emb_dim+10, self.num_classes))
+        if self.use_gap:
+            self.hidden0 = nn.Sequential(
+                nn.Linear(self.emb_dim+10, (self.emb_dim+10)* 2),
+                nn.ReLU(),
+                nn.Linear((self.emb_dim+10)* 2, self.emb_dim+10),
+                nn.ReLU(),
+                nn.Linear(self.emb_dim+10, self.num_classes))
+        else:
+            self.hidden0 = nn.Sequential(
+                nn.Linear(self.emb_dim, (self.emb_dim)* 2),
+                nn.ReLU(),
+                nn.Linear((self.emb_dim)* 2, self.emb_dim),
+                nn.ReLU(),
+                nn.Linear(self.emb_dim, self.num_classes))
     def forward(self, batched_data):
         h_node = self.gnn_node(batched_data)
         h_graph = self.pool0(h_node, batched_data.batch, batched_data.ptr)
-        gap = batched_data.g
-        h = torch.cat((h_graph, gap), dim=1)
+        if self.use_gap:
+            gap = batched_data.g
+            h = torch.cat((h_graph, gap), dim=1)
+        else:
+            h = h_graph
         output = self.hidden0(h)
         return output
 

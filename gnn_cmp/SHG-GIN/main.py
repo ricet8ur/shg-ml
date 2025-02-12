@@ -122,7 +122,7 @@ def test(model, data_loader, device):
         return y_true, y_pred
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
+# print(device)
 parser = argparse.ArgumentParser(description='CrystalGNN')
 parser.add_argument('--property', default='nlo',
                         choices=['matbench_dielectric', 'matbench_log_gvrh', 'matbench_log_kvrh',
