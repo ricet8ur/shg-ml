@@ -3,7 +3,11 @@ import orjson
 
 def save_to_json(data: dict, output_file: str):
     with open(output_file, "wb") as f:
-        f.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY))
+        f.write(
+            orjson.dumps(
+                data, option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
+            )
+        )
 
 
 def load_from_json(file):

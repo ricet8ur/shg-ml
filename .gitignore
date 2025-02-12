@@ -178,3 +178,8 @@ data/raw_data/private/*
 artifacts
 trained
 gnn_cmp/alignn/pre-trained/*
+gnn_cmp/SHG-GIN/predictions/*
+gnn_cmp/SHG-GIN/saved_model/*
+gnn_cmp/SHG-GIN/stat_res/*
+gnn_cmp/SHG-GIN/log.txt
+gnn_cmp/SHG-GIN/train_info.json
