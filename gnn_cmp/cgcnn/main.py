@@ -5,6 +5,7 @@ import sys
 import time
 import warnings
 from random import sample
+import random
 
 import numpy as np
 import torch
@@ -17,6 +18,12 @@ from torch.optim.lr_scheduler import MultiStepLR
 from cgcnn.data import CIFData
 from cgcnn.data import collate_pool, get_train_val_test_loader
 from cgcnn.model import CrystalGraphConvNet
+from torch.utils.data.sampler import SubsetRandomSampler
+from sklearn.model_selection import KFold, train_test_split
+from aim import Run
+sys.path.append('../../')
+from utils.experiment_tracking import track_metrics, log_mean_std_based_on_test_metrics
+from utils.save_and_load import save_to_json
 
 parser = argparse.ArgumentParser(description='Crystal Graph Convolutional Neural Networks')
 parser.add_argument('data_options', metavar='OPTIONS', nargs='+',
@@ -88,125 +95,279 @@ else:
     best_mae_error = 0.
 
 
-def main():
-    global args, best_mae_error
+def main(run: Run, ds_name: str):
+    run.set_artifacts_uri(f"file://{os.getcwd()}/artifacts/")
 
+    try:
+        os.mkdir("trained/" + ds_name)
+    except:
+        pass
+    global args, best_mae_error
+    args.data_options[0] += ds_name
     # load data
     dataset = CIFData(*args.data_options)
-    collate_fn = collate_pool
-    train_loader, val_loader, test_loader = get_train_val_test_loader(
-        dataset=dataset,
-        collate_fn=collate_fn,
-        batch_size=args.batch_size,
-        train_ratio=args.train_ratio,
-        num_workers=args.workers,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        pin_memory=args.cuda,
-        train_size=args.train_size,
-        val_size=args.val_size,
-        test_size=args.test_size,
-        return_test=True)
 
-    # obtain target value normalizer
-    if args.task == 'classification':
-        normalizer = Normalizer(torch.zeros(2))
-        normalizer.load_state_dict({'mean': 0., 'std': 1.})
-    else:
-        if len(dataset) < 500:
-            warnings.warn('Dataset has less than 500 data points. '
-                          'Lower accuracy is expected. ')
-            sample_data_list = [dataset[i] for i in range(len(dataset))]
+    # enable deterministic learning
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
+    random.seed(42)
+    np.random.seed(42)
+    g = torch.manual_seed(42)
+
+    k_folds = 10
+    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+    data_range = np.arange(0, len(dataset))
+
+    dataset_key_target = {}
+    fold_partition = {}
+    fold_partition_names = {}
+    crystal_predictions_log_for_all_folds = {}
+    for fold, (train_val_idx, test_idx) in enumerate(kfold.split(data_range)):
+        best_mae_error = 1e10
+        print(f"FOLD {fold}")
+        train_idx, val_idx = train_test_split(
+            train_val_idx, train_size=8 / 9, random_state=42
+        )
+        # log fold partition
+        fold_partition = dict(
+            fold=fold_partition.get("fold", {})
+            | {
+                fold: dict(
+                    train_idx=train_idx.tolist(),
+                    val_idx=val_idx.tolist(),
+                    test_idx=test_idx.tolist(),
+                )
+            }
+        )
+        fold_partition_names = dict(
+            fold=fold_partition_names.get("fold", {})
+            | {
+                fold: dict(
+                    train_names=[dataset[x][2] for x in train_idx.tolist()],
+                    val_names=[dataset[x][2] for x in val_idx.tolist()],
+                    test_names=[dataset[x][2] for x in test_idx.tolist()],
+                )
+            }
+        )
+        # to log prediction for each crystal
+        crystal_predictions_log = {}
+
+        t = time.time()
+        collate_fn = collate_pool
+        train_loader, val_loader, test_loader = get_train_val_test_loader(
+            dataset=dataset,
+            collate_fn=collate_fn,
+            batch_size=args.batch_size,
+            train_ratio=args.train_ratio,
+            num_workers=args.workers,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            pin_memory=args.cuda,
+            train_size=args.train_size,
+            val_size=args.val_size,
+            test_size=args.test_size,
+            train_sampler=SubsetRandomSampler(train_idx, g),
+            val_sampler=SubsetRandomSampler(val_idx, g),
+            test_sampler=SubsetRandomSampler(test_idx, g),
+            return_test=True,
+        )
+
+        # obtain target value normalizer
+        if args.task == "classification":
+            normalizer = Normalizer(torch.zeros(2))
+            normalizer.load_state_dict({"mean": 0.0, "std": 1.0})
         else:
-            sample_data_list = [dataset[i] for i in
-                                sample(range(len(dataset)), 500)]
-        _, sample_target, _ = collate_pool(sample_data_list)
-        normalizer = Normalizer(sample_target)
+            if len(dataset) < 500:
+                warnings.warn(
+                    "Dataset has less than 500 data points. "
+                    "Lower accuracy is expected. "
+                )
+                sample_data_list = [dataset[i] for i in range(len(dataset))]
+            else:
+                sample_data_list = [
+                    dataset[i] for i in sample(range(len(dataset)), 500)
+                ]
+            _, sample_target, _ = collate_pool(sample_data_list)
+            normalizer = Normalizer(sample_target)
 
-    # build model
-    structures, _, _ = dataset[0]
-    orig_atom_fea_len = structures[0].shape[-1]
-    nbr_fea_len = structures[1].shape[-1]
-    model = CrystalGraphConvNet(orig_atom_fea_len, nbr_fea_len,
-                                atom_fea_len=args.atom_fea_len,
-                                n_conv=args.n_conv,
-                                h_fea_len=args.h_fea_len,
-                                n_h=args.n_h,
-                                classification=True if args.task ==
-                                                       'classification' else False)
-    if args.cuda:
-        model.cuda()
+        # log dataset once for all folds
+        if len(list(dataset_key_target.keys())) == 0:
+            dataset_key_target = {key: target.tolist()[0] for _, target, key in dataset}
 
-    # define loss func and optimizer
-    if args.task == 'classification':
-        criterion = nn.NLLLoss()
-    else:
-        criterion = nn.MSELoss()
-    if args.optim == 'SGD':
-        optimizer = optim.SGD(model.parameters(), args.lr,
-                              momentum=args.momentum,
-                              weight_decay=args.weight_decay)
-    elif args.optim == 'Adam':
-        optimizer = optim.Adam(model.parameters(), args.lr,
-                               weight_decay=args.weight_decay)
-    else:
-        raise NameError('Only SGD or Adam is allowed as --optim')
+        # build model
+        structures, _, _ = dataset[0]
+        orig_atom_fea_len = structures[0].shape[-1]
+        nbr_fea_len = structures[1].shape[-1]
+        model = CrystalGraphConvNet(
+            orig_atom_fea_len,
+            nbr_fea_len,
+            atom_fea_len=args.atom_fea_len,
+            n_conv=args.n_conv,
+            h_fea_len=args.h_fea_len,
+            n_h=args.n_h,
+            classification=True if args.task == "classification" else False,
+        )
+        if args.cuda:
+            model.cuda()
 
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
-            args.start_epoch = checkpoint['epoch']
-            best_mae_error = checkpoint['best_mae_error']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            normalizer.load_state_dict(checkpoint['normalizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+        # define loss func and optimizer
+        if args.task == "classification":
+            criterion = nn.NLLLoss()
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
-
-    scheduler = MultiStepLR(optimizer, milestones=args.lr_milestones,
-                            gamma=0.1)
-
-    for epoch in range(args.start_epoch, args.epochs):
-        # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, normalizer)
-
-        # evaluate on validation set
-        mae_error = validate(val_loader, model, criterion, normalizer)
-
-        if mae_error != mae_error:
-            print('Exit due to NaN')
-            sys.exit(1)
-
-        scheduler.step()
-
-        # remember the best mae_eror and save checkpoint
-        if args.task == 'regression':
-            is_best = mae_error < best_mae_error
-            best_mae_error = min(mae_error, best_mae_error)
+            criterion = nn.MSELoss()
+        if args.optim == "SGD":
+            optimizer = optim.SGD(
+                model.parameters(),
+                args.lr,
+                momentum=args.momentum,
+                weight_decay=args.weight_decay,
+            )
+        elif args.optim == "Adam":
+            optimizer = optim.Adam(
+                model.parameters(), args.lr, weight_decay=args.weight_decay
+            )
         else:
-            is_best = mae_error > best_mae_error
-            best_mae_error = max(mae_error, best_mae_error)
-        save_checkpoint({
-            'epoch': epoch + 1,
-            'state_dict': model.state_dict(),
-            'best_mae_error': best_mae_error,
-            'optimizer': optimizer.state_dict(),
-            'normalizer': normalizer.state_dict(),
-            'args': vars(args)
-        }, is_best)
+            raise NameError("Only SGD or Adam is allowed as --optim")
 
-    # test best model
-    print('---------Evaluate Model on Test Set---------------')
-    best_checkpoint = torch.load('model_best.pth.tar')
-    model.load_state_dict(best_checkpoint['state_dict'])
-    validate(test_loader, model, criterion, normalizer, test=True)
+        # optionally resume from a checkpoint
+        if args.resume:
+            if os.path.isfile(args.resume):
+                print("=> loading checkpoint '{}'".format(args.resume))
+                checkpoint = torch.load(
+                    args.resume,
+                    map_location=torch.device("cuda" if args.cuda else "cpu"),
+                )
+                args.start_epoch = checkpoint["epoch"]
+                # best_mae_error = checkpoint['best_mae_error']
+                best_mae_error = 1e10
+                # print(checkpoint['state_dict'])
+                model.load_state_dict(checkpoint["state_dict"], strict=False)
+                # optimizer.load_state_dict(checkpoint['optimizer'])
+                # normalizer.load_state_dict(checkpoint["normalizer"])
+                print(
+                    "=> loaded checkpoint '{}' (epoch {})".format(
+                        args.resume, checkpoint["epoch"]
+                    )
+                )
+            else:
+                print("=> no checkpoint found at '{}'".format(args.resume))
+
+        run["model_parameters_count"] = sum(p.numel() for p in model.parameters())
+        run["model_trainable_parameters_count"] = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
+
+        scheduler = MultiStepLR(optimizer, milestones=args.lr_milestones, gamma=0.1)
+
+        for epoch in range(args.start_epoch, args.epochs):
+            # train for one epoch
+            train(
+                train_loader,
+                model,
+                criterion,
+                optimizer,
+                fold,
+                epoch,
+                normalizer,
+                run,
+                crystal_predictions_log,
+            )
+
+            # evaluate on train set
+            mae_error = validate(
+                train_loader,
+                model,
+                criterion,
+                normalizer,
+                fold,
+                epoch,
+                subset="train",
+                run=run,
+                crystal_predictions_log=crystal_predictions_log,
+            )
+            # evaluate on val set
+            mae_error = validate(
+                val_loader,
+                model,
+                criterion,
+                normalizer,
+                fold,
+                epoch,
+                subset="val",
+                run=run,
+                crystal_predictions_log=crystal_predictions_log,
+            )
+
+            if mae_error != mae_error:
+                print("Exit due to NaN")
+                sys.exit(1)
+
+            scheduler.step()
+
+            # remember the best mae_eror and save checkpoint
+            if args.task == "regression":
+                is_best = mae_error < best_mae_error
+                best_mae_error = min(mae_error, best_mae_error)
+            else:
+                is_best = mae_error > best_mae_error
+                best_mae_error = max(mae_error, best_mae_error)
+            save_checkpoint(
+                {
+                    "epoch": epoch + 1,
+                    "state_dict": model.state_dict(),
+                    "best_mae_error": best_mae_error,
+                    "optimizer": optimizer.state_dict(),
+                    "normalizer": normalizer.state_dict(),
+                    "args": vars(args),
+                },
+                is_best,
+            )
+        run.track(time.time() - t, name="train_time", context={"fold": fold})
+
+        # test best model
+        print("---------Evaluate Model on Test Set---------------")
+        t = time.time()
+        best_checkpoint = torch.load("model_best.pth.tar")
+        model.load_state_dict(best_checkpoint["state_dict"], strict=False)
+        validate(
+            test_loader,
+            model,
+            criterion,
+            normalizer,
+            fold,
+            epoch=0,
+            subset="test",
+            run=run,
+            crystal_predictions_log=crystal_predictions_log,
+        )
+        run.track(time.time() - t, name="test_time", context={"fold": fold})
+
+        crystal_predictions_log_for_all_folds = dict(
+            fold=crystal_predictions_log_for_all_folds.get("fold", {})
+            | {fold: crystal_predictions_log}
+        )
+        shutil.move(
+            "model_best.pth.tar",
+            f"trained/{ds_name}/model_{fold}.pth.tar",
+        )
+
+    jsons_to_log = dict(
+        fold_partition=fold_partition,
+        fold_partition_names=fold_partition_names,
+        dataset_key_target=dataset_key_target,
+        crystal_predictions_log_for_all_folds=crystal_predictions_log_for_all_folds,
+    )
+    json_name = "train_info.json"
+    save_to_json(jsons_to_log, json_name)
+    run.log_artifact(json_name)
+    shutil.move(
+        json_name,
+        f"trained/{ds_name}/{json_name}",
+    )
+    log_mean_std_based_on_test_metrics(run)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, normalizer):
+def train(train_loader, model, criterion, optimizer, fold, epoch, normalizer, run:Run,crystal_predictions_log:dict):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -223,7 +384,7 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
     model.train()
 
     end = time.time()
-    for i, (input, target, _) in enumerate(train_loader):
+    for i, (input, target, batch_cif_ids) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -302,7 +463,7 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
                 )
 
 
-def validate(val_loader, model, criterion, normalizer, test=False):
+def validate(val_loader, model, criterion, normalizer, fold:int, epoch:int, subset:str, run:Run,crystal_predictions_log:dict):
     batch_time = AverageMeter()
     losses = AverageMeter()
     if args.task == 'regression':
@@ -313,10 +474,9 @@ def validate(val_loader, model, criterion, normalizer, test=False):
         recalls = AverageMeter()
         fscores = AverageMeter()
         auc_scores = AverageMeter()
-    if test:
-        test_targets = []
-        test_preds = []
-        test_cif_ids = []
+    test_targets = []
+    test_preds = []
+    test_cif_ids = []
 
     # switch to evaluate mode
     model.eval()
@@ -355,12 +515,12 @@ def validate(val_loader, model, criterion, normalizer, test=False):
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
             losses.update(loss.data.cpu().item(), target.size(0))
             mae_errors.update(mae_error, target.size(0))
-            if test:
-                test_pred = normalizer.denorm(output.data.cpu())
-                test_target = target
-                test_preds += test_pred.view(-1).tolist()
-                test_targets += test_target.view(-1).tolist()
-                test_cif_ids += batch_cif_ids
+
+            test_pred = normalizer.denorm(output.data.cpu())
+            test_target = target
+            test_preds += test_pred.view(-1).tolist()
+            test_targets += test_target.view(-1).tolist()
+            test_cif_ids += batch_cif_ids
         else:
             accuracy, precision, recall, fscore, auc_score = \
                 class_eval(output.data.cpu(), target)
@@ -370,13 +530,13 @@ def validate(val_loader, model, criterion, normalizer, test=False):
             recalls.update(recall, target.size(0))
             fscores.update(fscore, target.size(0))
             auc_scores.update(auc_score, target.size(0))
-            if test:
-                test_pred = torch.exp(output.data.cpu())
-                test_target = target
-                assert test_pred.shape[1] == 2
-                test_preds += test_pred[:, 1].tolist()
-                test_targets += test_target.view(-1).tolist()
-                test_cif_ids += batch_cif_ids
+
+            test_pred = torch.exp(output.data.cpu())
+            test_target = target
+            assert test_pred.shape[1] == 2
+            test_preds += test_pred[:, 1].tolist()
+            test_targets += test_target.view(-1).tolist()
+            test_cif_ids += batch_cif_ids
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -402,8 +562,22 @@ def validate(val_loader, model, criterion, normalizer, test=False):
                     i, len(val_loader), batch_time=batch_time, loss=losses,
                     accu=accuracies, prec=precisions, recall=recalls,
                     f1=fscores, auc=auc_scores))
+    track_metrics(
+        run,
+        subset=subset,
+        fold=fold,
+        epoch=epoch,
+        loss=losses.avg,
+        keys=test_cif_ids,
+        predict=test_preds,
+        target=test_targets,
+        to_track=subset != 'test',
+    )
+    for i, k in enumerate(test_cif_ids):
+        crystal_predictions_log.setdefault(k, [])
+        crystal_predictions_log[k].append(test_preds[i])
 
-    if test:
+    if subset == 'test':
         star_label = '**'
         import csv
         with open('test_results.csv', 'w') as f:
