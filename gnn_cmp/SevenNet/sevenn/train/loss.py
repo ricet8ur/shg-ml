@@ -91,6 +91,38 @@ class PerAtomEnergyLoss(LossDefinition):
             batch_data[self.ref_key] / num_atoms,
         )
 
+class ScalarLoss(LossDefinition):
+    """
+    Loss for energy|shg_max_abs|shg_avg
+    """
+
+    def __init__(
+        self,
+        name: str = 'Energy',
+        unit: str = 'eV',
+        criterion: Optional[Callable] = None,
+        ref_key: str = KEY.ENERGY,
+        pred_key: str = KEY.PRED_TOTAL_ENERGY,
+    ):
+        super().__init__(
+            name=name,
+            unit=unit,
+            criterion=criterion,
+            ref_key=ref_key,
+            pred_key=pred_key
+        )
+
+    def _preprocess(
+        self,
+        batch_data: Dict[str, Any],
+        model: Optional[Callable] = None
+    ):
+        assert isinstance(self.pred_key, str) and isinstance(self.ref_key, str)
+        return (
+            batch_data[self.pred_key],
+            batch_data[self.ref_key],
+        )
+
 
 class ForceLoss(LossDefinition):
     """

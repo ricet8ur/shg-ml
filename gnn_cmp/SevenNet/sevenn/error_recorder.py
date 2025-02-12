@@ -319,11 +319,11 @@ class ErrorRecorder:
         metrics = []
         energy_metric = CustomError(criteria, **get_err_type('Energy'))
         metrics.append((energy_metric, 1))
-        force_metric = CustomError(criteria, **get_err_type('Force'))
-        metrics.append((force_metric, config[KEY.FORCE_WEIGHT]))
-        if is_stress:
-            stress_metric = CustomError(criteria, **get_err_type('Stress'))
-            metrics.append((stress_metric, config[KEY.STRESS_WEIGHT]))
+        # force_metric = CustomError(criteria, **get_err_type('Force'))
+        # metrics.append((force_metric, config[KEY.FORCE_WEIGHT]))
+        # if is_stress:
+        #     stress_metric = CustomError(criteria, **get_err_type('Stress'))
+        #     metrics.append((stress_metric, config[KEY.STRESS_WEIGHT]))
         total_loss_metric = CombinedError(
             metrics, name='TotalLoss', unit=None, ref_key=None, pred_key=None
         )

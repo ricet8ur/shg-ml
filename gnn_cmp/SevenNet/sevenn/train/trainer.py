@@ -13,6 +13,15 @@ from sevenn.train.loss import LossDefinition
 
 from .loss import get_loss_functions_from_config
 from .optim import optim_dict, scheduler_dict
+from aim import Run
+import sys
+
+sys.path.append('../../')
+from utils.experiment_tracking import (
+    track_metrics,
+    log_mean_std_based_on_test_metrics,
+)
+from utils.save_and_load import save_to_json
 
 
 class Trainer:
@@ -43,6 +52,8 @@ class Trainer:
         device: Union[torch.device, str] = 'auto',
         distributed: bool = False,
         distributed_backend: str = 'nccl',
+        run: Run | None = None,
+        fold: int = 0,
     ):
         if device == 'auto':
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -76,6 +87,9 @@ class Trainer:
         else:
             self.scheduler = None
         self.loss_functions = loss_functions
+        self.run: Run | None = run
+        self.fold: int = fold
+        self.crystal_predictions_log: dict = {}
 
     @staticmethod
     def from_config(model: torch.nn.Module, config: Dict[str, Any]) -> 'Trainer':
@@ -137,6 +151,8 @@ class Trainer:
         is_train: bool = False,
         error_recorder: Optional[ErrorRecorder] = None,
         wrap_tqdm: Union[bool, int] = False,
+        epoch: int = 0,
+        subset: str = 'train',
     ) -> None:
         """
         Run single epoch with given dataloader
@@ -154,19 +170,49 @@ class Trainer:
         if wrap_tqdm:
             total_len = wrap_tqdm if isinstance(wrap_tqdm, int) else None
             loader = tqdm(loader, total=total_len)
+        loss_array = []
+        all_preds = []
+        all_targets = []
+        ids = []
         for _, batch in enumerate(loader):
             if is_train:
                 self.optimizer.zero_grad()
             batch = batch.to(self.device, non_blocking=True)
+            # print(batch)
             output = self.model(batch)
             if error_recorder is not None:
                 error_recorder.update(output)
+            ids.extend(batch['crystal_idx'].data.cpu().tolist())
+            total_loss = torch.tensor([0.0], device=self.device)
+            for loss_def, w in self.loss_functions:
+                pred, ref = loss_def._preprocess(output, self.model)
+                # print(
+                #     # pred.data.cpu().tolist(),
+                #     ref.data.cpu().tolist(),
+                #     batch['crystal_idx'].data.cpu().tolist(),
+                # )
+                all_preds.extend(pred.data.cpu().tolist())
+                all_targets.extend(ref.data.cpu().tolist())
+                total_loss += loss_def.get_loss(output, self.model) * w
             if is_train:
-                total_loss = torch.tensor([0.0], device=self.device)
-                for loss_def, w in self.loss_functions:
-                    total_loss += loss_def.get_loss(output, self.model) * w
                 total_loss.backward()
                 self.optimizer.step()
+            loss_array.append(total_loss.data.cpu().item())
+        if self.run is not None:
+            track_metrics(
+                self.run,
+                subset=subset,
+                fold=self.fold,
+                epoch=epoch,
+                loss=sum(loss_array),
+                keys=ids,
+                predict=all_preds,
+                target=all_targets,
+                to_track=subset != 'test',
+            )
+            for i, k in enumerate(ids):
+                self.crystal_predictions_log.setdefault(k, [])
+                self.crystal_predictions_log[k].append(all_preds[i])
 
         if self.distributed and error_recorder is not None:
             self.recorder_all_reduce(error_recorder)
